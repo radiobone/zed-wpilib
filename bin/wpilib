@@ -92,6 +92,8 @@ def ask(prompt, default=None, validate=None):
         try:
             val = input(f"{bold(prompt)}{suffix}: ").strip()
         except EOFError:
+            if default is None:
+                die("cancelled (no input)")
             val = ""
         if not val and default is not None:
             val = str(default)
@@ -169,7 +171,8 @@ def installed_years():
 def wpilib_home(year=None):
     years = installed_years()
     if not years:
-        die(f"No WPILib install found in {WPILIB_ROOT}. Install WPILib from https://github.com/wpilibsuite/allwpilib/releases")
+        die(f"WPILib isn't installed (nothing in {WPILIB_ROOT}). Install it first: "
+            "https://docs.wpilib.org/en/stable/docs/zero-to-robot/step-2/wpilib-setup.html")
     year = str(year or os.environ.get("WPILIB_YEAR") or years[0])
     home = WPILIB_ROOT / year
     if not home.is_dir():
@@ -1155,7 +1158,11 @@ def open_url(u):
 
 def cmd_docs(a):
     p = Project.find(a.project, required=False)
-    home = p.home if p else wpilib_home(a.year)
+    if not installed_years():  # no local copy of the docs; the online ones work fine
+        a.online = True
+        home = WPILIB_ROOT / "none"
+    else:
+        home = p.home if p else wpilib_home(a.year)
     which = a.which or (p.language if p else None) or pick("Documentation", ["frc-docs", "java", "cpp"],
                                                            label=lambda w: {"frc-docs": "FRC docs (guides)", "java": "Java API (WPILibJ)", "cpp": "C++ API (WPILibC)"}[w])
     which = {"guide": "frc-docs", "frc": "frc-docs", "c++": "cpp"}.get(which, which)

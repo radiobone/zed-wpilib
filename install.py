@@ -154,10 +154,12 @@ def install():
     install_tasks()
     install_keymap()
     install_settings()
-    try:
+    if wp.installed_years():
         wp.resources(wp.wpilib_home())  # unpack templates now so the first `wpilib new` is instant
-    except SystemExit:
-        print("  note: WPILib isn't installed yet. Install it, then run `wpilib doctor`.")
+    else:
+        print("\n  WPILib isn't installed yet. zed-wpilib is ready, but it needs WPILib to build robot code.")
+        print("  Install it: https://docs.wpilib.org/en/stable/docs/zero-to-robot/step-2/wpilib-setup.html")
+        print("  You don't need to run this installer again afterwards.")
     picker = "Cmd-Shift-R" if IS_MAC else "Alt-Shift-T"
     print(f"\nDone. Restart Zed, then press {picker} and type WPILib.")
 
