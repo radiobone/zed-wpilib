@@ -1,0 +1,1594 @@
+#!/usr/bin/env python3
+"""wpilib — the WPILib VS Code extension's commands, for Zed (or any terminal).
+
+Run `wpilib --help` for the command list. Every command works from anywhere
+inside a robot project; Zed tasks call these with the project root.
+"""
+import argparse
+import fnmatch
+import json
+import os
+import platform
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import time
+import urllib.request
+import zipfile
+from pathlib import Path
+
+IS_MAC = sys.platform == "darwin"
+IS_WIN = os.name == "nt"
+HOME = Path.home()
+# WPILib installs to C:\Users\Public\wpilib on Windows and ~/wpilib elsewhere.
+_DEFAULT_ROOT = Path(os.environ.get("PUBLIC", r"C:\Users\Public")) / "wpilib" if IS_WIN else HOME / "wpilib"
+WPILIB_ROOT = Path(os.environ.get("WPILIB_ROOT", _DEFAULT_ROOT))
+if IS_WIN:
+    CACHE = Path(os.environ.get("LOCALAPPDATA", HOME / "AppData" / "Local")) / "zed-wpilib" / "cache"
+    os.system("")  # turn on ANSI colors in Windows consoles
+else:
+    CACHE = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "zed-wpilib"
+# How Zed's debugger should call this script back: absolute paths, so PATH doesn't matter.
+SELF_ARGS = ["-X", "utf8", str(Path(__file__).resolve())]
+REPO_DIR = Path(__file__).resolve().parent.parent
+MARKETPLACE = "https://frcmaven.wpi.edu/artifactory/vendordeps/vendordep-marketplace/"
+
+
+def zed_config_dir():
+    """Where Zed keeps settings.json / tasks.json / keymap.json on this OS."""
+    if IS_WIN:
+        return Path(os.environ.get("APPDATA", HOME / "AppData" / "Roaming")) / "Zed"
+    if not IS_MAC and os.environ.get("XDG_CONFIG_HOME"):
+        return Path(os.environ["XDG_CONFIG_HOME"]) / "zed"
+    return HOME / ".config" / "zed"
+
+
+def zed_installed():
+    if shutil.which("zed") or shutil.which("zeditor"):
+        return True
+    if IS_MAC:
+        return Path("/Applications/Zed.app").exists() or (HOME / "Applications/Zed.app").exists()
+    if IS_WIN:
+        local = Path(os.environ.get("LOCALAPPDATA", ""))
+        return (local / "Programs" / "Zed" / "Zed.exe").exists()
+    return (HOME / ".local" / "zed.app").exists()
+
+DEFAULT_SETTINGS = {
+    "offline": False,            # run build/test/sim with --offline
+    "deployOffline": True,       # run deploy/debug with --offline (VS Code default)
+    "skipTests": False,          # deploy with -x check
+    "autoStartRioLog": False,    # start RioLog after a successful deploy
+    "skipSelectSimulateExtension": False,  # sim: use default extensions without asking
+    "stopSimulationOnEntry": False,
+    "additionalGradleArguments": "",
+    "cppToolchain": "linuxathena",  # which C++ binary type clangd should index
+}
+
+# ---------------------------------------------------------------- output
+
+
+def _c(code):
+    return (lambda s: f"\033[{code}m{s}\033[0m") if sys.stdout.isatty() or os.environ.get("ZED_TERM") else (lambda s: s)
+
+
+bold, red, green, yellow, cyan, dim = _c(1), _c(31), _c(32), _c(33), _c(36), _c(2)
+
+
+def die(msg, code=1):
+    print(red("error: ") + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def info(msg):
+    print(cyan("==> ") + msg, flush=True)
+
+
+def ask(prompt, default=None, validate=None):
+    while True:
+        suffix = f" [{default}]" if default not in (None, "") else ""
+        try:
+            val = input(f"{bold(prompt)}{suffix}: ").strip()
+        except EOFError:
+            val = ""
+        if not val and default is not None:
+            val = str(default)
+        if validate is None:
+            return val
+        err = validate(val)
+        if err is None:
+            return val
+        print(red(err))
+
+
+def ask_yes(prompt, default=True):
+    d = "Y/n" if default else "y/N"
+    val = ask(f"{prompt} ({d})", "").lower()
+    return default if not val else val.startswith("y")
+
+
+def pick(prompt, items, label=lambda x: x, multi=False, preselected=None):
+    """Numbered picker with filtering. Returns an item (or list when multi)."""
+    shown = list(range(len(items)))
+    preselected = set(preselected or [])
+    while True:
+        print()
+        for n, i in enumerate(shown, 1):
+            mark = ""
+            if multi:
+                mark = green("[x] ") if i in preselected else "[ ] "
+            print(f"  {dim(str(n).rjust(3))}  {mark}{label(items[i])}")
+        if multi:
+            hint = "numbers separated by spaces, Enter to accept the [x] ones, 'none' for none"
+        else:
+            hint = "number, or text to filter"
+        try:
+            val = input(f"{bold(prompt)} ({hint}): ").strip()
+        except EOFError:
+            die("cancelled")
+        if multi:
+            if val == "":
+                return [items[i] for i in sorted(preselected)]
+            if val.lower() == "none":
+                return []
+            try:
+                nums = [int(x) for x in val.replace(",", " ").split()]
+                return [items[shown[n - 1]] for n in nums]
+            except (ValueError, IndexError):
+                print(red("Enter numbers from the list."))
+                continue
+        if val.isdigit() and 1 <= int(val) <= len(shown):
+            return items[shown[int(val) - 1]]
+        if val:
+            plain = lambda i: re.sub(r"\033\[[0-9;]*m", "", label(items[i])).lower()
+            exact = [i for i in range(len(items)) if plain(i).split("  ")[0].strip() == val.lower()
+                     or (isinstance(items[i], str) and items[i].lower() == val.lower())]
+            if len(exact) == 1:
+                return items[exact[0]]
+            f = [i for i in range(len(items)) if val.lower() in plain(i)]
+            if len(f) == 1:
+                return items[f[0]]
+            if f:
+                shown = f
+                continue
+            print(red("No match."))
+        shown = list(range(len(items)))
+
+
+# ---------------------------------------------------------------- WPILib install
+
+
+def installed_years():
+    if not WPILIB_ROOT.is_dir():
+        return []
+    return sorted((p.name for p in WPILIB_ROOT.iterdir() if p.name.isdigit() and (p / "jdk").is_dir()), reverse=True)
+
+
+def wpilib_home(year=None):
+    years = installed_years()
+    if not years:
+        die(f"No WPILib install found in {WPILIB_ROOT}. Install WPILib from https://github.com/wpilibsuite/allwpilib/releases")
+    year = str(year or os.environ.get("WPILIB_YEAR") or years[0])
+    home = WPILIB_ROOT / year
+    if not home.is_dir():
+        die(f"WPILib {year} is not installed (have: {', '.join(years)}). Install it, or import the project to {years[0]} with `wpilib import`.")
+    return home
+
+
+def jdk_home(home):
+    return home / "jdk"
+
+
+def resources(home):
+    """The WPILib VS Code extension ships every template/example. Extract it once and reuse it."""
+    vsix = sorted((home / "vsCodeExtensions").glob("vscode-wpilib-*.vsix"))
+    if not vsix:
+        die(f"Can't find vscode-wpilib-*.vsix in {home / 'vsCodeExtensions'} (it holds the project templates).")
+    vsix = vsix[-1]
+    dest = CACHE / vsix.stem
+    res = dest / "extension" / "resources"
+    if not (dest / ".done").exists():
+        info(f"Unpacking templates from {vsix.name} (first run only)")
+        shutil.rmtree(dest, ignore_errors=True)
+        with zipfile.ZipFile(vsix) as z:
+            for m in z.infolist():
+                if m.filename.startswith("extension/resources/"):
+                    target = (dest / m.filename).resolve()
+                    if not str(target).startswith(str(dest.resolve())):
+                        continue
+                    z.extract(m, dest)
+        (dest / ".done").write_text("ok")
+    return res
+
+
+# ---------------------------------------------------------------- project
+
+
+class Project:
+    def __init__(self, root: Path):
+        self.root = root
+        self.prefs_path = root / ".wpilib" / "wpilib_preferences.json"
+        self.settings_path = root / ".wpilib" / "zed_settings.json"
+
+    @staticmethod
+    def find(start=None, required=True):
+        start = Path(start or os.environ.get("WPILIB_PROJECT") or os.getcwd()).resolve()
+        for p in [start, *start.parents]:
+            if (p / ".wpilib" / "wpilib_preferences.json").exists() and (p / "build.gradle").exists():
+                return Project(p)
+        # A Zed worktree may contain the robot project one level down.
+        if start.is_dir():
+            for child in sorted(start.iterdir()):
+                if (child / ".wpilib" / "wpilib_preferences.json").exists():
+                    return Project(child)
+        if required:
+            die(f"{start} is not inside a WPILib project (no .wpilib/wpilib_preferences.json). "
+                "Create one with `wpilib new`.")
+        return None
+
+    @property
+    def prefs(self):
+        return json.loads(self.prefs_path.read_text())
+
+    def save_prefs(self, prefs):
+        self.prefs_path.write_text(json.dumps(prefs, indent=4) + "\n")
+
+    @property
+    def settings(self):
+        s = dict(DEFAULT_SETTINGS)
+        if self.settings_path.exists():
+            s.update(json.loads(self.settings_path.read_text()))
+        return s
+
+    def save_settings(self, s):
+        changed = {k: v for k, v in s.items() if DEFAULT_SETTINGS.get(k) != v}
+        self.settings_path.write_text(json.dumps(changed, indent=4) + "\n")
+
+    @property
+    def language(self):
+        lang = self.prefs.get("currentLanguage", "none")
+        if lang == "none":
+            lang = "cpp" if (self.root / "src" / "main" / "cpp").exists() else "java"
+        return lang
+
+    @property
+    def year(self):
+        return self.prefs.get("projectYear")
+
+    @property
+    def home(self):
+        y = self.year
+        if y and y.isdigit() and not (WPILIB_ROOT / y).is_dir():
+            years = installed_years()
+            print(yellow(f"warning: project is for WPILib {y}, which isn't installed; using {years[0] if years else '?'}. "
+                         "Run `wpilib import` to upgrade the project."))
+            return wpilib_home()
+        return wpilib_home(y if y and y.isdigit() else None)
+
+    def team(self, override=None, ask_if_missing=True):
+        if override is not None:
+            return int(override)
+        t = int(self.prefs.get("teamNumber", -1))
+        if t < 0 and ask_if_missing:
+            t = int(ask("No team number set. Team number", validate=valid_team))
+            p = self.prefs
+            p["teamNumber"] = t
+            self.save_prefs(p)
+            write_zed_files(self, quiet=True)
+        return t
+
+    def gradle_version(self):
+        m = re.search(r'id\s+"edu\.wpi\.first\.GradleRIO"\s+version\s+"([^"]+)"', (self.root / "build.gradle").read_text())
+        return m.group(1) if m else None
+
+
+def valid_team(v):
+    return None if re.fullmatch(r"\d{1,5}", v or "") else "Team number must be 1-5 digits."
+
+
+def gradle(project, args, offline=None, check=True, quiet=False):
+    home = project.home
+    jdk = jdk_home(home)
+    s = project.settings
+    gw = project.root / ("gradlew.bat" if IS_WIN else "gradlew")
+    if not gw.exists():
+        die(f"{gw} is missing.")
+    if not IS_WIN:
+        gw.chmod(gw.stat().st_mode | 0o111)
+    cmd = [str(gw), *args]
+    if s["additionalGradleArguments"]:
+        cmd += s["additionalGradleArguments"].split()
+    if (s["offline"] if offline is None else offline) and "--offline" not in cmd:
+        cmd.append("--offline")
+    cmd.append(f"-Dorg.gradle.java.home={jdk}")
+    env = dict(os.environ, JAVA_HOME=str(jdk))
+    env["PATH"] = f"{jdk / 'bin'}{os.pathsep}{env.get('PATH', '')}"
+    if not quiet:
+        info(" ".join(cmd[:1 + len(args)]).replace(str(project.root) + os.sep, "./"))
+    rc = subprocess.call(cmd, cwd=project.root, env=env)
+    if check and rc != 0:
+        print(red(f"\nGradle failed (exit {rc})."), file=sys.stderr)
+        sys.exit(rc)
+    return rc
+
+
+# ---------------------------------------------------------------- build / test / deploy / sim
+
+
+def cmd_build(a):
+    p = Project.find(a.project)
+    tasks = ["build"]
+    if p.language == "cpp":
+        tasks.append("generateVsCodeConfig")
+    gradle(p, tasks + a.extra)
+    if p.language == "cpp":
+        refresh_cpp(p, quiet=True)
+    print(green("\nBuild succeeded."))
+
+
+def cmd_test(a):
+    p = Project.find(a.project)
+    gradle(p, ["check" if p.language == "cpp" else "test"] + a.extra)
+    print(green("\nTests passed."))
+
+
+def cmd_clean(a):
+    p = Project.find(a.project)
+    gradle(p, ["clean"] + a.extra)
+
+
+def cmd_gradle(a):
+    p = Project.find(a.project)
+    if not a.extra:
+        a.extra = ask("Gradle arguments (e.g. tasks, dependencies)").split()
+    sys.exit(gradle(p, a.extra, check=False))
+
+
+def cmd_deploy(a):
+    p = Project.find(a.project)
+    team = p.team(a.team)
+    s = p.settings
+    args = ["deploy", f"-PteamNumber={team}"]
+    if a.debug:
+        args.append("-PdebugMode")
+    if p.language == "java" and s["skipTests"]:
+        args.append("-xcheck")
+    offline = s["deployOffline"] or s["offline"]
+    gradle(p, args + a.extra, offline=offline)
+    if a.debug:
+        write_debug_target(p, team)
+    print(green(f"\nDeployed to team {team}."))
+    if s["autoStartRioLog"] and not a.debug:
+        riolog(team)
+
+
+def write_debug_target(p, team):
+    """After a debug deploy GradleRIO writes build/debug/*.json with the address it actually used."""
+    info_file = p.root / "build" / "debug" / "debug_info.json"
+    if not info_file.exists():
+        return
+    try:
+        targets = json.loads(info_file.read_text())
+        detail = json.loads(Path(targets[0]["path"]).read_text())[0]
+        host, port = detail.get("target"), detail.get("port")
+        print(f"Debugger listening on {bold(f'{host}:{port}')}")
+        # Keep .zed/debug.json pointed at the address that worked (USB, ethernet or radio).
+        write_zed_files(p, quiet=True, robot_host=host, debug_port=port)
+    except (KeyError, IndexError, ValueError, OSError):
+        pass
+
+
+def choose_extensions(p, exts, hw=False):
+    if not exts:
+        return []
+    default = [i for i, e in enumerate(exts) if e.get("defaultEnabled")]
+    if p.settings["skipSelectSimulateExtension"]:
+        return [exts[i] for i in default]
+    return pick("Simulation extensions", exts, label=lambda e: e["name"], multi=True, preselected=default)
+
+
+def cmd_sim(a):
+    p = Project.find(a.project)
+    lang = p.language
+    if lang == "java":
+        task, json_name = "simulateExternalJavaRelease", "release_java.json"
+    else:
+        task = "simulateExternalNativeDebug" if a.debug_build else "simulateExternalNativeRelease"
+        json_name = "debug_native.json" if a.debug_build else "release_native.json"
+    args = [task] + (["-PhwSim"] if a.hw else []) + a.extra
+    gradle(p, args)
+    cfgs = json.loads((p.root / "build" / "sim" / json_name).read_text())
+    if not cfgs:
+        die("No simulation configurations found. Is desktop support enabled? (`wpilib desktop on` for C++)")
+    cfg = cfgs[0] if len(cfgs) == 1 else pick("Artifact to simulate", cfgs, label=lambda c: c["name"])
+    if a.prepare:  # Zed's debugger launches the program itself (see .zed/debug.json)
+        return
+    exts = choose_extensions(p, cfg.get("extensions", []), a.hw)
+    env = dict(os.environ)
+    env["HALSIM_EXTENSIONS"] = os.pathsep.join(e["libName"] for e in exts)
+    env.update(cfg.get("environment") or {})
+    if lang == "java":
+        libdir = cfg["libraryDir"]
+        env["DYLD_LIBRARY_PATH"] = env["LD_LIBRARY_PATH"] = libdir
+        if IS_WIN:
+            env["PATH"] = libdir + os.pathsep + env["PATH"]
+        java = jdk_home(p.home) / "bin" / ("java.exe" if IS_WIN else "java")
+        jar = sorted((p.root / "build" / "libs").glob("*.jar"))
+        cp = os.pathsep.join(str(j) for j in jar) or str(p.root / "build" / "classes" / "java" / "main")
+        cmd = [str(java), f"-Djava.library.path={libdir}"]
+        if IS_MAC:
+            cmd.append("-XstartOnFirstThread")
+        cmd += ["-cp", cp, cfg["mainClassName"]]
+    else:
+        libdirs = sorted({str(Path(x).parent) for x in cfg.get("libpaths", [])} | {str(Path(cfg["launchfile"]).parent)})
+        env["DYLD_FALLBACK_LIBRARY_PATH"] = env["LD_LIBRARY_PATH"] = os.pathsep.join(libdirs)
+        cmd = [cfg["launchfile"]]
+    info("Starting simulation" + (f" with {', '.join(e['name'] for e in exts)}" if exts else "") + "  (Ctrl-C to stop)")
+    sys.stdout.flush()
+    os.chdir(p.root)
+    if IS_WIN:  # Windows has no real exec; run it as a child instead
+        try:
+            sys.exit(subprocess.call(cmd, env=env))
+        except KeyboardInterrupt:
+            sys.exit(130)
+    # Replace this process so stopping the Zed task stops the robot program too.
+    os.execvpe(cmd[0], cmd, env)
+
+
+# ---------------------------------------------------------------- RioLog
+
+
+def robot_addresses(team):
+    t = int(team)
+    return ["172.22.11.2", f"roboRIO-{t}-FRC.local", f"10.{t // 100}.{t % 100}.2",
+            f"roboRIO-{t}-FRC.lan", f"roboRIO-{t}-FRC.frc-field.local"]
+
+
+def ds_robot_ip():
+    """Ask a running Driver Station (port 1742) which IP it is talking to."""
+    try:
+        with socket.create_connection(("127.0.0.1", 1742), timeout=0.5) as s:
+            s.settimeout(1)
+            data = json.loads(s.recv(4096).decode())
+            ip = int(data.get("robotIP", 0))
+            if ip:
+                return socket.inet_ntoa(struct.pack(">I", ip))
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def connect_robot(team, port, timeout=2.0):
+    import concurrent.futures as cf
+    hosts = robot_addresses(team)
+    ds = ds_robot_ip()
+    if ds:
+        hosts.insert(0, ds)
+
+    def try_one(h):
+        s = socket.create_connection((h, port), timeout=timeout)
+        return h, s
+
+    with cf.ThreadPoolExecutor(len(hosts)) as ex:
+        futs = [ex.submit(try_one, h) for h in hosts]
+        winner = None
+        for f in cf.as_completed(futs):
+            try:
+                r = f.result()
+            except OSError:
+                continue
+            if winner is None:
+                winner = r
+            else:
+                r[1].close()
+        return winner
+
+
+def riolog(team):
+    """Same protocol as VS Code's RioLog: the roboRIO's console server on TCP 1741."""
+    print(bold(f"RioLog for team {team}") + dim("  (Ctrl-C to stop; reconnects automatically)"))
+    try:
+        while True:
+            conn = connect_robot(team, 1741)
+            if conn is None:
+                print(dim("waiting for robot..."), end="\r", flush=True)
+                time.sleep(1)
+                continue
+            host, s = conn
+            print(green(f"connected to {host}") + " " * 20)
+            s.settimeout(None)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            buf = b""
+            try:
+                while True:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while len(buf) >= 2:
+                        size = struct.unpack(">H", buf[:2])[0]
+                        if len(buf) < 2 + size:
+                            break
+                        frame, buf = buf[2:2 + size], buf[2 + size:]
+                        print_rio_frame(frame)
+            except OSError:
+                pass
+            finally:
+                s.close()
+            print(yellow("disconnected"))
+    except KeyboardInterrupt:
+        print()
+
+
+def _sized(b, off):
+    n = struct.unpack(">H", b[off:off + 2])[0]
+    return b[off + 2:off + 2 + n].decode("utf8", "replace"), off + 2 + n
+
+
+def print_rio_frame(frame):
+    if not frame:
+        return
+    tag, body = frame[0], frame[1:]
+    try:
+        if tag == 12:  # print
+            ts = struct.unpack(">f", body[:4])[0]
+            line = body[6:].decode("utf8", "replace")
+            print(f"{dim(f'{ts:9.3f}')} {line}", end="" if line.endswith("\n") else "\n", flush=True)
+        elif tag == 11:  # error / warning
+            ts, _seq, _num, code, flags = struct.unpack(">fhhiB", body[:13])
+            details, off = _sized(body, 13)
+            location, off = _sized(body, off)
+            stack, off = _sized(body, off)
+            color = red if flags & 1 else yellow
+            kind = "ERROR" if flags & 1 else "WARNING"
+            print(color(f"{ts:9.3f} {kind} {code}: {details}"), flush=True)
+            if location:
+                print(color(f"          at {location}"))
+            if stack.strip():
+                print(dim(stack.rstrip()))
+    except struct.error:
+        pass
+
+
+def cmd_riolog(a):
+    if a.team is not None:
+        team = int(a.team)
+    else:
+        p = Project.find(a.project, required=False)
+        team = p.team() if p else int(ask("Team number", validate=valid_team))
+    riolog(team)
+
+
+# ---------------------------------------------------------------- new project / import
+
+
+def load_list(res, lang, kind):
+    return json.loads((res / lang / "src" / kind / f"{kind}.json").read_text())
+
+
+def copytree(src, dst, ignore_bin=True):
+    def ign(d, names):
+        rel = os.path.relpath(d, src)
+        return [n for n in names if ignore_bin and ((rel == "." and n == "bin") or ".project" in n)]
+    shutil.copytree(src, dst, dirs_exist_ok=True, ignore=ign)
+
+
+JAVA_PKG_RE = re.compile(r"edu\.wpi\.first\.wpilibj\.(?:examples|templates)\..+?(?=;|\.)")
+
+
+def generate_project(res, lang, entry, kind, dest: Path, team, desktop=False):
+    """Mirror of the VS Code extension's generateCopyJava / generateCopyCpp."""
+    if dest.exists() and any(dest.iterdir()):
+        die(f"{dest} is not empty.")
+    dest.mkdir(parents=True, exist_ok=True)
+    src_root = res / lang / "src" / kind
+    test_root = res / lang / "src" / f"{kind}_test"
+    folder = entry["foldername"]
+    gradle_dir = res / "gradle"
+    gradlebase = gradle_dir / entry["gradlebase"]
+    version = (gradle_dir / "version.txt").read_text().strip()
+
+    if lang == "java":
+        main_dir = dest / "src" / "main" / "java" / "frc" / "robot"
+        test_dir = dest / "src" / "test" / "java" / "frc" / "robot"
+        copytree(src_root / folder, main_dir, ignore_bin=False)
+        if entry.get("hasunittests") and (test_root / folder).exists():
+            copytree(test_root / folder, test_dir, ignore_bin=False)
+        for d in (main_dir, test_dir):
+            if not d.exists():
+                continue
+            for f in d.rglob("*"):
+                if f.suffix in (".java", ".gradle"):
+                    f.write_text(JAVA_PKG_RE.sub("frc.robot", f.read_text()))
+    else:
+        copytree(src_root / folder, dest / "src" / "main", ignore_bin=False)
+        if entry.get("hasunittests") and (test_root / folder).exists():
+            copytree(test_root / folder, dest / "src" / "test", ignore_bin=False)
+
+    copytree(gradlebase, dest)
+    copytree(gradle_dir / "shared", dest)
+    gw = dest / "gradlew"
+    gw.chmod(gw.stat().st_mode | 0o755)
+    bg = dest / "build.gradle"
+    txt = bg.read_text().replace("###GRADLERIOREPLACE###", version).replace("###ROBOTCLASSREPLACE###", "frc.robot.Main")
+    if desktop:
+        txt = re.sub(r"def\s+includeDesktopSupport\s*=\s*(true|false)", "def includeDesktopSupport = true", txt)
+    bg.write_text(txt)
+
+    deploy = dest / "src" / "main" / "deploy"
+    deploy.mkdir(parents=True, exist_ok=True)
+    if lang == "java":
+        hint = ("Files placed in this directory will be deployed to the RoboRIO into the\n'deploy' directory in the home "
+                "folder. Use the 'Filesystem.getDeployDirectory' wpilib function\nto get a proper path relative to the deploy directory.")
+    else:
+        hint = ("Files placed in this directory will be deployed to the RoboRIO into the\n  'deploy' directory in the home "
+                "folder. Use the 'frc::filesystem::GetDeployDirectory'\n  function from the 'frc/Filesystem.h' header to get a "
+                "proper path relative to the deploy\n  directory.")
+    (deploy / "example.txt").write_text(hint)
+
+    vd = dest / "vendordeps"
+    vd.mkdir(exist_ok=True)
+    shutil.copy(res / "vendordeps" / "WPILibNewCommands.json", vd)
+    for extra in entry.get("extravendordeps", []):
+        name = {"romi": "RomiVendordep.json", "xrp": "XRPVendordep.json"}.get(extra)
+        if name:
+            shutil.copy(res / "vendordeps" / name, vd)
+
+    p = Project(dest)
+    prefs = p.prefs
+    prefs["teamNumber"] = int(team)
+    p.save_prefs(prefs)
+    return p
+
+
+def subprocess_quiet(cmd, cwd):
+    try:
+        subprocess.run(cmd, cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    except OSError:
+        pass
+
+
+def open_in_zed(path):
+    zed = shutil.which("zed") or shutil.which("zeditor")
+    win_exe = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Zed" / "Zed.exe"
+    if zed:
+        subprocess.Popen([zed, str(path)])
+    elif IS_MAC:
+        subprocess.Popen(["open", "-a", "Zed", str(path)])
+    elif IS_WIN and win_exe.exists():
+        subprocess.Popen([str(win_exe), str(path)])
+    else:
+        print(f"Open {path} in Zed (File > Open).")
+
+
+def cmd_new(a):
+    home = wpilib_home(a.year)
+    res = resources(home)
+    if a.list:
+        for lang in ("java", "cpp"):
+            for kind in ("templates", "examples"):
+                print(bold(f"\n{lang} {kind}:"))
+                for e in load_list(res, lang, kind):
+                    print(f"  {e['name']}  {dim(e['description'])}")
+        return
+    print(bold(f"Create a new WPILib {home.name} project"))
+    kind = a.type or pick("Project type", ["templates", "examples"], label=lambda k: {"templates": "Template (a blank robot to build on)", "examples": "Example (working sample code)"}[k])
+    lang = a.lang or pick("Language", ["java", "cpp"], label=lambda l: {"java": "Java", "cpp": "C++"}[l])
+    entries = load_list(res, lang, kind)
+    if a.base:
+        m = [e for e in entries if a.base.lower() in (e["name"].lower(), e["foldername"].lower())]
+        if not m:
+            die(f"No {lang} {kind[:-1]} named {a.base!r}. Use `wpilib new --list`.")
+        entry = m[0]
+    else:
+        entry = pick("Project base", entries, label=lambda e: f"{e['name']}  {dim('— ' + e['description'])}")
+    parent = Path(os.path.expanduser(a.dir or ask("Folder to create the project in", str(HOME / "Documents" / "FRC"))))
+    name = a.name or ask("Project name", re.sub(r"[^A-Za-z0-9]+", "", entry["name"]) or "Robot")
+    team = a.team if a.team is not None else ask("Team number", validate=valid_team)
+    desktop = a.desktop if a.desktop is not None else (lang == "cpp" and ask_yes("Enable desktop support (needed for C++ simulation and unit tests)?", True))
+    dest = parent / name
+    info(f"Creating {entry['name']} ({lang}) in {dest}")
+    p = generate_project(res, lang, entry, kind, dest, team, desktop)
+    if a.git and shutil.which("git"):
+        subprocess_quiet(["git", "init", "-q"], dest)
+        subprocess_quiet(["git", "add", "-A"], dest)
+        subprocess_quiet(["git", "commit", "-qm", "Initial commit"], dest)
+    write_zed_files(p)
+    print(green(f"\nCreated {dest}"))
+    if not a.no_open:
+        open_in_zed(dest)
+
+
+def cmd_import(a):
+    """Port a 2020-2025 project to the installed WPILib year (like VS Code's Gradle import)."""
+    home = wpilib_home(a.year)
+    res = resources(home)
+    old = Path(os.path.expanduser(a.source or ask("Old project folder (the one with build.gradle)"))).resolve()
+    old_prefs = old / ".wpilib" / "wpilib_preferences.json"
+    if not old_prefs.exists():
+        die(f"{old} has no .wpilib/wpilib_preferences.json; is it a WPILib project?")
+    lang = json.loads(old_prefs.read_text()).get("currentLanguage")
+    if lang not in ("java", "cpp"):
+        die("Couldn't tell whether the old project is Java or C++.")
+    old_bg = (old / "build.gradle").read_text()
+    main_class = "frc.robot.Main"
+    if lang == "java":
+        m = re.search(r'def ROBOT_MAIN_CLASS = "(.+)"', old_bg)
+        main_class = m.group(1) if m else ask("Robot main class", "frc.robot.Main")
+    romi, xrp = "romi" in old_bg.lower(), "xrp" in old_bg.lower()
+    desktop = bool(re.search(r"def\s+includeDesktopSupport\s*=\s*true", old_bg))
+    dest = Path(os.path.expanduser(a.dest or ask("New project folder", str(old.parent / (old.name + "-" + home.name))))).resolve()
+    if dest == old:
+        die("Pick a different folder from the old project.")
+    if dest.exists() and any(dest.iterdir()):
+        die(f"{dest} is not empty.")
+    team = a.team if a.team is not None else json.loads(old_prefs.read_text()).get("teamNumber", -1)
+    if (old / "vendordeps" / "WPILibOldCommands.json").exists():
+        print(yellow("WPILib no longer supports the old command framework; WPILibOldCommands was not imported."))
+
+    info(f"Importing {old} -> {dest}")
+    dest.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(old / "src", dest / "src", dirs_exist_ok=True)
+    gname = ("javaromi" if romi else "javaxrp" if xrp else "java") if lang == "java" else ("cppromi" if romi else "cppxrp" if xrp else "cpp")
+    copytree(res / "gradle" / gname, dest)
+    copytree(res / "gradle" / "shared", dest)
+    (dest / "gradlew").chmod(0o755)
+    version = (res / "gradle" / "version.txt").read_text().strip()
+    bg = dest / "build.gradle"
+    txt = bg.read_text().replace("###GRADLERIOREPLACE###", version).replace("###ROBOTCLASSREPLACE###", main_class)
+    if desktop:
+        txt = re.sub(r"def\s+includeDesktopSupport\s*=\s*(true|false)", "def includeDesktopSupport = true", txt)
+    bg.write_text(txt)
+    (dest / "old-build.gradle").write_text(old_bg)
+    vd = dest / "vendordeps"
+    vd.mkdir(exist_ok=True)
+    shutil.copy(res / "vendordeps" / "WPILibNewCommands.json", vd)
+    for f in (old / "vendordeps").glob("*.json") if (old / "vendordeps").exists() else []:
+        if f.name not in ("WPILibOldCommands.json", "WPILibNewCommands.json"):
+            shutil.copy(f, vd)
+    p = Project(dest)
+    prefs = p.prefs
+    prefs["teamNumber"] = int(team)
+    p.save_prefs(prefs)
+    repl = json.loads((res / ("java_replacements.json" if lang == "java" else "cpp_replacements.json")).read_text())
+    for group in repl:
+        pat = group["fileMatcher"].replace("**/", "")
+        for f in dest.rglob("*"):
+            if f.is_file() and fnmatch.fnmatch(f.name, pat):
+                t = f.read_text(errors="replace")
+                n = t
+                for r in group["replacements"]:
+                    n = re.sub(r["from"], r["to"], n)
+                if n != t:
+                    f.write_text(n)
+    write_zed_files(p)
+    print(green(f"\nImported to {dest}"))
+    print(yellow("Your old build.gradle is saved as old-build.gradle; copy any custom changes into the new build.gradle."))
+    print(yellow("Vendor libraries were copied as-is: run `wpilib vendordep update` to get versions for " + home.name + "."))
+    if not a.no_open:
+        open_in_zed(dest)
+
+
+# ---------------------------------------------------------------- new class / command
+
+
+def cmd_new_class(a):
+    p = Project.find(a.project)
+    res = resources(p.home)
+    lang = p.language
+    entries = json.loads((res / lang / "src" / "commands" / "commands.json").read_text())
+    entry = pick("Create a new class/command", entries, label=lambda e: f"{e['name']}  {dim('— ' + e['description'])}") if not a.kind else \
+        next((e for e in entries if a.kind.lower() in (e["name"].lower(), e["foldername"])), None) or die(f"Unknown kind {a.kind}")
+    name = a.name or ask("Class name", validate=lambda v: None if re.fullmatch(r"[A-Za-z_]\w*", v) else "Use a valid class name.")
+    src = res / lang / "src" / "commands" / entry["foldername"]
+    target = Path(a.dir).resolve() if a.dir else None
+    if lang == "java":
+        jroot = p.root / "src" / "main" / "java"
+        if target is None or jroot not in [target, *target.parents]:
+            target = jroot / "frc" / "robot" / ("commands" if "command" in entry["foldername"] else "subsystems" if "subsystem" in entry["foldername"] else "")
+        if target.is_file():
+            target = target.parent
+        target.mkdir(parents=True, exist_ok=True)
+        pkg = ".".join(target.relative_to(jroot).parts)
+        out = target / f"{name}.java"
+        if out.exists():
+            die(f"{out} already exists.")
+        tmpl = next(src.glob("*.java")).read_text()
+        tmpl = tmpl.replace(entry["replacename"], name).replace("package edu.wpi.first.wpilibj.commands", f"package {pkg}")
+        tmpl = re.sub(r"^package [\w.]+;", f"package {pkg};", tmpl, count=1, flags=re.M)
+        out.write_text(tmpl)
+        made = [out]
+    else:
+        cpp_root, inc_root = p.root / "src" / "main" / "cpp", p.root / "src" / "main" / "include"
+        sub = Path(".")
+        if target is not None:
+            for r in (cpp_root, inc_root):
+                if r in [target, *target.parents]:
+                    sub = (target if target.is_dir() else target.parent).relative_to(r)
+        made = []
+        for f in src.iterdir():
+            base = inc_root if f.suffix == ".h" else cpp_root
+            out = base / sub / f.name.replace(entry["replacename"], name)
+            if out.exists():
+                die(f"{out} already exists.")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            t = f.read_text()
+            inc = (sub / name).as_posix() if str(sub) != "." else name
+            t = t.replace(f'#include "{entry["replacename"]}.h"', f'#include "{inc}.h"').replace(entry["replacename"], name)
+            out.write_text(t)
+            made.append(out)
+    for m in made:
+        print(green("created ") + str(m.relative_to(p.root)))
+    if shutil.which("zed") and not a.no_open:
+        subprocess.Popen(["zed", *map(str, made)])
+
+
+# ---------------------------------------------------------------- vendor libraries
+
+
+def read_json_url(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "zed-wpilib"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode())
+
+
+def installed_deps(p):
+    out = []
+    vd = p.root / "vendordeps"
+    for f in sorted(vd.glob("*.json")) if vd.exists() else []:
+        try:
+            d = json.loads(f.read_text())
+            d["_file"] = f
+            out.append(d)
+        except ValueError:
+            print(yellow(f"warning: {f.name} is not valid JSON"))
+    return out
+
+
+def ver_key(v):
+    return [int(x) if x.isdigit() else x for x in re.split(r"[.\-]", str(v))]
+
+
+def newer(a, b):
+    try:
+        return ver_key(a) > ver_key(b)
+    except TypeError:
+        return str(a) > str(b)
+
+
+def install_dep(p, dep):
+    year = p.year or p.home.name
+    fy = str(dep.get("frcYear", year))
+    if fy and fy != year:
+        print(yellow(f"warning: {dep['name']} is for {fy}, project is {year}"))
+    vd = p.root / "vendordeps"
+    vd.mkdir(exist_ok=True)
+    for f in vd.glob("*.json"):  # replace any older copy (same uuid)
+        try:
+            if json.loads(f.read_text()).get("uuid") == dep.get("uuid"):
+                f.unlink()
+        except ValueError:
+            pass
+    clean = {k: v for k, v in dep.items() if not k.startswith("_")}
+    name = dep.get("fileName") or f"{dep['name']}.json"
+    (vd / name).write_text(json.dumps(clean, indent=4) + "\n")
+    print(green("installed ") + f"{dep['name']} {dep.get('version', '')}")
+
+
+def home_deps(p):
+    out = []
+    for f in sorted((p.home / "vendordeps").glob("*.json")):
+        try:
+            d = json.loads(f.read_text())
+            d["_file"] = f
+            out.append(d)
+        except ValueError:
+            pass
+    return out
+
+
+def marketplace(p):
+    year = p.year or p.home.name
+    try:
+        return read_json_url(f"{MARKETPLACE}{year}.json")
+    except Exception as e:  # network down, DNS, etc.
+        print(yellow(f"Couldn't reach the vendor library list ({e}). Showing offline libraries only."))
+        return []
+
+
+def fetch_listing(item):
+    path = item.get("path", "")
+    url = path if path.startswith("http") else MARKETPLACE + path
+    return read_json_url(url)
+
+
+def after_dep_change(p):
+    print(dim("Building so the language server picks up the new libraries..."))
+    gradle(p, ["build", "-x", "test"] if p.language == "java" else ["generateVsCodeConfig"], check=False)
+    if p.language == "cpp":
+        refresh_cpp(p, quiet=True)
+
+
+def cmd_vendordep(a):
+    p = Project.find(a.project)
+    action = a.action or pick("Vendor libraries", ["list", "add", "update", "remove"], label=lambda x: {
+        "list": "Show installed libraries", "add": "Install a library (online list, offline, or URL/file)",
+        "update": "Check for updates", "remove": "Uninstall libraries"}[x])
+    installed = installed_deps(p)
+    have = {d.get("uuid") for d in installed}
+    if action == "list":
+        if not installed:
+            print("No vendor libraries installed.")
+        for d in installed:
+            print(f"  {bold(d['name'])} {d.get('version', '')}  {dim(d['_file'].name)}")
+        return
+    if action == "remove":
+        if not installed:
+            print("No vendor libraries installed.")
+            return
+        chosen = [d for d in installed if a.target and a.target.lower() in d["name"].lower()] if a.target else \
+            pick("Libraries to uninstall", installed, label=lambda d: f"{d['name']} {d.get('version', '')}", multi=True)
+        for d in chosen:
+            d["_file"].unlink()
+            print(yellow("removed ") + d["name"])
+        if chosen and not a.no_build:
+            after_dep_change(p)
+        return
+    if action == "add":
+        target = a.target
+        dep = None
+        if target and (target.startswith("http") or os.path.exists(os.path.expanduser(target))):
+            dep = read_json_url(target) if target.startswith("http") else json.loads(Path(os.path.expanduser(target)).read_text())
+            if target.startswith("http"):
+                dep.setdefault("jsonUrl", target)
+            install_dep(p, dep)
+        else:
+            choices = []
+            for item in marketplace(p):
+                if item.get("uuid") not in have:
+                    choices.append(("online", item))
+            for d in home_deps(p):
+                if d.get("uuid") not in have and not any(c[1].get("uuid") == d.get("uuid") for c in choices):
+                    choices.append(("offline", d))
+            choices.append(("url", {"name": "Enter a vendor JSON URL or file path...", "uuid": None}))
+            if target:
+                choices = [c for c in choices if target.lower() in c[1]["name"].lower()]
+                if not choices:
+                    die(f"No library matching {target!r}.")
+                sel = choices[:1]
+            else:
+                sel = pick("Libraries to install", choices, multi=True, label=lambda c: (
+                    f"{c[1]['name']} {c[1].get('version', '')}  " + dim(
+                        {"online": "online", "offline": "from WPILib install"}.get(c[0], "") +
+                        (" — " + c[1]["description"] if c[1].get("description") else ""))))
+            for src, item in sel:
+                if src == "url":
+                    u = ask("Vendor JSON URL or file path")
+                    dep = read_json_url(u) if u.startswith("http") else json.loads(Path(os.path.expanduser(u)).read_text())
+                elif src == "online":
+                    try:
+                        dep = fetch_listing(item)
+                    except Exception as e:
+                        print(red(f"failed to download {item['name']}: {e}"))
+                        continue
+                else:
+                    dep = item
+                install_dep(p, dep)
+        if dep is not None and not a.no_build:
+            after_dep_change(p)
+        return
+    if action == "update":
+        updates = []
+        home = {d.get("uuid"): d for d in home_deps(p)}
+        for d in installed:
+            best = None
+            if d.get("jsonUrl") and not a.offline:
+                try:
+                    online = read_json_url(d["jsonUrl"])
+                    if online.get("uuid") == d.get("uuid") and newer(online.get("version"), d.get("version")):
+                        best = online
+                except Exception as e:
+                    print(dim(f"{d['name']}: couldn't check online ({e.__class__.__name__})"))
+            h = home.get(d.get("uuid"))
+            if h and newer(h.get("version"), d.get("version")) and (not best or newer(h["version"], best["version"])):
+                best = h
+            if best:
+                updates.append((d, best))
+        if not updates:
+            print(green("All vendor libraries are up to date."))
+            return
+        sel = updates if a.yes else pick("Libraries to update", updates, multi=True,
+                                         preselected=range(len(updates)),
+                                         label=lambda u: f"{u[0]['name']}  {u[0].get('version')} -> {green(u[1].get('version'))}")
+        for _, new in sel:
+            install_dep(p, new)
+        if sel and not a.no_build:
+            after_dep_change(p)
+
+
+# ---------------------------------------------------------------- team / settings / info
+
+
+def cmd_team(a):
+    p = Project.find(a.project)
+    t = a.number if a.number is not None else ask("Team number", p.prefs.get("teamNumber") if p.prefs.get("teamNumber", -1) >= 0 else None, valid_team)
+    prefs = p.prefs
+    prefs["teamNumber"] = int(t)
+    p.save_prefs(prefs)
+    write_zed_files(p, quiet=True)
+    print(green(f"Team number set to {t}."))
+
+
+def cmd_language(a):
+    p = Project.find(a.project)
+    lang = a.lang or pick("Project language", ["java", "cpp"])
+    prefs = p.prefs
+    prefs["currentLanguage"] = lang
+    prefs["enableCppIntellisense"] = lang == "cpp"
+    p.save_prefs(prefs)
+    write_zed_files(p, quiet=True)
+    print(green(f"Language set to {lang}."))
+
+
+def cmd_desktop(a):
+    p = Project.find(a.project)
+    bg = p.root / "build.gradle"
+    txt = bg.read_text()
+    m = re.search(r"def\s+includeDesktopSupport\s*=\s*(true|false)", txt)
+    if not m:
+        die("build.gradle has no includeDesktopSupport line.")
+    cur = m.group(1) == "true"
+    new = {"on": True, "off": False}.get(a.state, not cur) if a.state else (not cur if ask_yes(f"Desktop support is {'on' if cur else 'off'}. Turn it {'off' if cur else 'on'}?") else cur)
+    bg.write_text(txt[:m.start()] + f"def includeDesktopSupport = {'true' if new else 'false'}" + txt[m.end():])
+    print(green(f"Desktop support {'enabled' if new else 'disabled'}."))
+
+
+def cmd_settings(a):
+    p = Project.find(a.project)
+    s = p.settings
+    if a.key:
+        if a.key not in DEFAULT_SETTINGS:
+            die(f"Unknown setting {a.key}. Known: {', '.join(DEFAULT_SETTINGS)}")
+        d = DEFAULT_SETTINGS[a.key]
+        if a.value is None and not isinstance(d, bool):
+            print(s[a.key])
+            return
+        if a.value is None:  # bare boolean key: toggle it
+            a.value = "false" if s[a.key] else "true"
+        s[a.key] = a.value.lower() in ("1", "true", "yes", "on") if isinstance(d, bool) else a.value
+        p.save_settings(s)
+        print(green(f"{a.key} = {s[a.key]}"))
+        return
+    while True:
+        keys = list(DEFAULT_SETTINGS)
+        k = pick("Toggle a setting (q to quit)", keys + ["done"], label=lambda k: k if k == "done" else f"{k} = {bold(str(s[k]))}")
+        if k == "done":
+            break
+        if isinstance(DEFAULT_SETTINGS[k], bool):
+            s[k] = not s[k]
+        else:
+            s[k] = ask(k, s[k])
+        p.save_settings(s)
+    if p.language == "cpp":
+        write_zed_files(p, quiet=True)
+
+
+def cmd_info(a):
+    p = Project.find(a.project)
+    prefs, home = p.prefs, p.home
+    rows = [
+        ("Project", p.root), ("Language", p.language), ("Project year", prefs.get("projectYear")),
+        ("Team number", prefs.get("teamNumber")), ("GradleRIO", p.gradle_version()),
+        ("WPILib install", home), ("JDK", jdk_home(home)),
+        ("Vendor libraries", ", ".join(f"{d['name']} {d.get('version', '')}" for d in installed_deps(p)) or "none"),
+        ("Settings", json.dumps({k: v for k, v in p.settings.items() if DEFAULT_SETTINGS[k] != v} or "defaults").strip('"')),
+    ]
+    for k, v in rows:
+        print(f"{bold(k.ljust(17))} {v}")
+
+
+# ---------------------------------------------------------------- tools / docs
+
+
+TOOL_ALIASES = {"advantagescope": "AdvantageScope", "elastic": "Elastic", "glass": "Glass", "sysid": "SysId",
+                "outlineviewer": "OutlineViewer", "shuffleboard": "Shuffleboard", "pathweaver": "PathWeaver",
+                "robotbuilder": "RobotBuilder", "datalogtool": "DataLogTool", "wpical": "wpical",
+                "teamnumbersetter": "roboRIOTeamNumberSetter", "roboriotteamnumbersetter": "roboRIOTeamNumberSetter",
+                "smartdashboard": "SmartDashboard"}
+
+
+def list_tools(home):
+    """Each OS ships different launchers: .app/binaries on macOS, .exe/.vbs on Windows, binaries/.sh/.py on Linux."""
+    tools = {}
+    td = home / "tools"
+    skip = {"artifacts", "processstarter", "processstarter.exe", "tools.json"}
+    order = {".app": 0, ".exe": 0, "": 1, ".vbs": 2, ".sh": 3, ".py": 4}
+    for f in sorted(td.iterdir()) if td.exists() else []:
+        if f.name in skip or f.stem.startswith("ToolsUpdater") or f.suffix not in order:
+            continue
+        if f.suffix == "" and not (f.is_file() and os.access(f, os.X_OK)):
+            continue
+        if f.suffix == ".py" and not IS_WIN and (td / f.stem).exists():
+            continue
+        cur = tools.get(f.stem)
+        if cur is None or order[f.suffix] < order[cur.suffix]:
+            tools[f.stem] = f
+    return tools
+
+
+def cmd_tool(a):
+    p = Project.find(a.project, required=False)
+    home = p.home if p else wpilib_home(a.year)
+    tools = list_tools(home)
+    if not tools:
+        die(f"No tools found in {home / 'tools'}.")
+    if a.name:
+        key = TOOL_ALIASES.get(a.name.lower().replace(" ", "").replace("-", ""), a.name)
+        match = [n for n in tools if n.lower() == key.lower()] or [n for n in tools if key.lower() in n.lower()]
+        if not match:
+            die(f"No tool named {a.name}. Have: {', '.join(tools)}")
+        name = match[0]
+    else:
+        name = pick("Start tool", sorted(tools, key=str.lower))
+    path = tools[name]
+    info(f"Starting {name}")
+    env = dict(os.environ, JAVA_HOME=str(jdk_home(home)))
+    cwd = str(p.root) if p else None
+    if path.suffix == ".app" and IS_MAC:
+        subprocess.Popen(["open", "-n", "-a", str(path)], env=env)
+        return
+    cmd = {".vbs": ["wscript", str(path)], ".py": [sys.executable, str(path)], ".sh": ["sh", str(path)]}.get(path.suffix, [str(path)])
+    extra = {"creationflags": 0x00000008 | 0x00000200} if IS_WIN else {"start_new_session": True}  # detach from the task
+    subprocess.Popen(cmd, env=env, cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **extra)
+
+
+def open_url(u):
+    if IS_MAC:
+        subprocess.Popen(["open", u])
+    elif IS_WIN:
+        os.startfile(u)  # type: ignore[attr-defined]
+    else:
+        subprocess.Popen(["xdg-open", u])
+
+
+def cmd_docs(a):
+    p = Project.find(a.project, required=False)
+    home = p.home if p else wpilib_home(a.year)
+    which = a.which or (p.language if p else None) or pick("Documentation", ["frc-docs", "java", "cpp"],
+                                                           label=lambda w: {"frc-docs": "FRC docs (guides)", "java": "Java API (WPILibJ)", "cpp": "C++ API (WPILibC)"}[w])
+    which = {"guide": "frc-docs", "frc": "frc-docs", "c++": "cpp"}.get(which, which)
+    local = home / "documentation" / which / "index.html"
+    online = {"frc-docs": "https://docs.wpilib.org/", "java": f"https://github.wpilib.org/allwpilib/docs/release/java/",
+              "cpp": "https://github.wpilib.org/allwpilib/docs/release/cpp/"}[which]
+    if not local.exists() and which in ("java", "cpp"):
+        found = list((home / "documentation" / which).rglob("index.html"))
+        local = min(found, key=lambda f: len(f.parts)) if found else local
+    open_url(local.as_uri() if local.exists() and not a.online else online)
+
+
+# ---------------------------------------------------------------- C++ IntelliSense (clangd)
+
+
+def refresh_cpp(p, quiet=False, run_gradle=False):
+    """Turn GradleRIO's build/vscodeconfig.json into build/compile_commands.json for clangd."""
+    if run_gradle:
+        gradle(p, ["generateVsCodeConfig"])
+    cfg_file = p.root / "build" / "vscodeconfig.json"
+    if not cfg_file.exists():
+        if not quiet:
+            die("build/vscodeconfig.json missing; run a build first.")
+        return
+    chains = json.loads(cfg_file.read_text())
+    if not chains:
+        return
+    want = p.settings["cppToolchain"]
+    named = [t for t in chains if t.get("name") == want] or chains
+    tc = next((t for t in named if t.get("buildType") == "debug"), named[0])
+    cmds, seen = [], set()
+    for bin_ in tc.get("binaries", []):
+        sets = bin_.get("sourceSets", [])
+        headers = [d for s in sets for d in s.get("exportedHeaders", {}).get("srcDirs", [])]
+        headers += bin_.get("libHeaders", [])
+        for sset in sets:
+            is_cpp = sset.get("cpp", True)
+            args = [tc.get("cppPath") if is_cpp else tc.get("cPath")]
+            args += tc.get("systemCppArgs" if is_cpp else "systemCArgs", [])
+            args += sset.get("args", [])
+            args += [f"-D{m}" for m in tc.get("systemCppMacros" if is_cpp else "systemCMacros", []) + sset.get("macros", [])]
+            args += [f"-I{h.rstrip('/')}" for h in headers]
+            src = sset.get("source", {})
+            pats = [x.replace("**/", "") for x in src.get("includes", [])] or ["*.cpp", "*.cc", "*.c"]
+            for d in src.get("srcDirs", []):
+                for f in sorted(Path(d).rglob("*")):
+                    if f.is_file() and any(fnmatch.fnmatch(f.name, x) for x in pats) and str(f) not in seen:
+                        seen.add(str(f))
+                        cmds.append({"directory": str(p.root), "file": str(f), "arguments": args + ["-c", str(f)]})
+    out = p.root / "build" / "compile_commands.json"
+    out.write_text(json.dumps(cmds, indent=1))
+    if not quiet:
+        print(green(f"C++ IntelliSense refreshed: {len(cmds)} files, toolchain {tc.get('name')}."))
+
+
+def cmd_cpp(a):
+    p = Project.find(a.project)
+    if a.toolchain:
+        s = p.settings
+        s["cppToolchain"] = a.toolchain
+        p.save_settings(s)
+    elif a.select:
+        cfg_file = p.root / "build" / "vscodeconfig.json"
+        if not cfg_file.exists():
+            gradle(p, ["generateVsCodeConfig"])
+        names = sorted({t["name"] for t in json.loads(cfg_file.read_text())})
+        s = p.settings
+        s["cppToolchain"] = pick("C++ toolchain for IntelliSense", names)
+        p.save_settings(s)
+    refresh_cpp(p, run_gradle=True)
+
+
+# ---------------------------------------------------------------- Zed project files
+
+
+JAVA_FAVORITES = ["org.junit.Assert.*", "org.junit.Assume.*", "org.junit.jupiter.api.Assertions.*",
+                  "org.junit.jupiter.api.Assumptions.*", "org.junit.jupiter.api.DynamicContainer.*",
+                  "org.junit.jupiter.api.DynamicTest.*", "org.mockito.Mockito.*", "org.mockito.ArgumentMatchers.*",
+                  "org.mockito.Answers.*", "edu.wpi.first.units.Units.*"]
+JAVA_FILTERED = ["java.awt.*", "com.sun.*", "sun.*", "jdk.*", "org.graalvm.*", "io.micrometer.shaded.*", "java.beans.*",
+                 "java.util.Base64.*", "java.util.Timer", "java.sql.*", "javax.swing.*", "javax.management.*",
+                 "javax.smartcardio.*", "edu.wpi.first.math.proto.*", "edu.wpi.first.math.**.proto.*",
+                 "edu.wpi.first.math.**.struct.*"]
+MARK = "zed-wpilib"
+
+
+def load_jsonc(path):
+    """Read Zed's JSON-with-comments files."""
+    txt = path.read_text()
+    out, i, n, in_str = [], 0, len(txt), False
+    while i < n:
+        c = txt[i]
+        if in_str:
+            out.append(c)
+            if c == "\\":
+                out.append(txt[i + 1] if i + 1 < n else "")
+                i += 1
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+            out.append(c)
+        elif txt.startswith("//", i):
+            while i < n and txt[i] != "\n":
+                i += 1
+            continue
+        elif txt.startswith("/*", i):
+            j = txt.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        else:
+            out.append(c)
+        i += 1
+    clean = re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+    return json.loads(clean) if clean.strip() else None
+
+
+def deep_merge(dst, src):
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            deep_merge(dst[k], v)
+        else:
+            dst[k] = v
+    return dst
+
+
+def find_modern_jdk():
+    """JDTLS (Zed's Java language server) needs JDK 25+ to run. Robot code still builds with WPILib's JDK 17."""
+    cands = []
+    for pat in ("/opt/homebrew/opt/openjdk*/libexec/openjdk.jdk/Contents/Home", "/usr/local/opt/openjdk*/libexec/openjdk.jdk/Contents/Home",
+                "/Library/Java/JavaVirtualMachines/*/Contents/Home", str(HOME / "Library/Java/JavaVirtualMachines/*/Contents/Home"),
+                "/usr/lib/jvm/*", r"C:\Program Files\Java\*", r"C:\Program Files\Eclipse Adoptium\*",
+                r"C:\Program Files\Microsoft\jdk-*", r"C:\Program Files\Amazon Corretto\*", r"C:\Program Files\Zulu\*"):
+        cands += [Path(x) for x in __import__("glob").glob(pat)]
+    best = None
+    for c in cands:
+        rel = c / "release"
+        if not rel.exists():
+            continue
+        m = re.search(r'JAVA_VERSION="(\d+)', rel.read_text())
+        # Prefer the newest; on a tie prefer the shorter (unversioned, upgrade-proof) path like .../opt/openjdk.
+        key = (int(m.group(1)), -len(str(c))) if m else None
+        if key and key[0] >= 25 and (best is None or key > best[0]):
+            best = (key, c)
+    return best[1] if best else None
+
+
+def zed_settings(p):
+    jdk = str(jdk_home(p.home))
+    s = {}
+    if p.language == "java":
+        modern = find_modern_jdk()
+        jdtls_settings = {"java_home": str(modern)} if modern else {"jdk_auto_download": True}
+        s["lsp"] = {
+            "jdtls": {
+                "settings": jdtls_settings,
+                "initialization_options": {"settings": {"java": {
+                    "configuration": {"updateBuildConfiguration": "automatic",
+                                      "runtimes": [{"name": "JavaSE-17", "path": jdk, "default": True}]},
+                    "import": {"gradle": {"enabled": True, "wrapper": {"enabled": True},
+                                          "java": {"home": jdk}, "annotationProcessing": {"enabled": False}}},
+                    "completion": {"favoriteStaticMembers": JAVA_FAVORITES, "filteredTypes": JAVA_FILTERED},
+                }}},
+            },
+            "gradle-language-server": {"settings": {"java_home": jdk, "gradleWrapperEnabled": True}},
+        }
+    else:
+        tc_dir = p.home / "roborio" / "bin"
+        s["lsp"] = {"clangd": {"binary": {"arguments": [
+            f"--query-driver={tc_dir.as_posix()}/*-g++*,{tc_dir.as_posix()}/*-gcc*,/usr/bin/clang++,/usr/bin/c++",
+            "--background-index", "--header-insertion=never"]}}}
+    s["file_scan_exclusions"] = ["**/.git", "**/.DS_Store", "**/bin", "**/.classpath", "**/.project",
+                                 "**/.settings", "**/.factorypath", "**/*~"]
+    return s
+
+
+def zed_debug(p, robot_host=None, debug_port=None):
+    team = int(p.prefs.get("teamNumber", -1))
+    host = robot_host or (f"roboRIO-{team}-FRC.local" if team >= 0 else "172.22.11.2")
+    root = "$ZED_WORKTREE_ROOT"
+    if p.language == "java":
+        libdir = f"{root}/build/jni/release"
+        ext = ".dylib" if IS_MAC else ".dll" if IS_WIN else ".so"
+        prefix = "" if IS_WIN else "lib"
+        vm = f"-Djava.library.path={libdir}" + (" -XstartOnFirstThread" if IS_MAC else "")
+        return [
+            {"label": "WPILib: Debug Robot Code (roboRIO)", "adapter": "Java", "request": "attach",
+             "hostName": host, "port": int(debug_port or 8349), "timeout": 60000,
+             "build": {"command": sys.executable, "args": [*SELF_ARGS, "deploy", "--debug", "--project", root]}},
+            {"label": "WPILib: Simulate Robot Code (with debugger)", "adapter": "Java", "request": "launch",
+             "mainClass": "frc.robot.Main", "cwd": root, "vmArgs": vm, "console": "integratedTerminal",
+             "stopOnEntry": bool(p.settings["stopSimulationOnEntry"]),
+             "env": {"HALSIM_EXTENSIONS": f"{libdir}/{prefix}halsim_gui{ext}",
+                     "DYLD_LIBRARY_PATH": libdir, "LD_LIBRARY_PATH": libdir},
+             "build": {"command": sys.executable, "args": [*SELF_ARGS, "sim", "--prepare", "--project", root]}},
+        ]
+    # C++: desktop simulation under CodeLLDB; roboRIO via LLDB's gdb-remote (gdbserver on the RIO).
+    plat = "osxuniversal" if IS_MAC else "windowsx86-64" if IS_WIN else "linuxx86-64"
+    prog = f"{root}/build/install/frcUserProgram/{plat}/debug/lib/frcUserProgram"
+    libs = f"{root}/build/install/frcUserProgram/{plat}/debug/lib"
+    ext = ".dylib" if IS_MAC else ".dll" if IS_WIN else ".so"
+    return [
+        {"label": "WPILib: Simulate Robot Code (with debugger)", "adapter": "CodeLLDB", "request": "launch",
+         "program": prog, "cwd": root, "stopOnEntry": bool(p.settings["stopSimulationOnEntry"]),
+         "env": {"HALSIM_EXTENSIONS": f"{libs}/libhalsim_guid{ext}", "DYLD_FALLBACK_LIBRARY_PATH": libs, "LD_LIBRARY_PATH": libs},
+         "build": {"command": sys.executable, "args": [*SELF_ARGS, "sim", "--prepare", "--debug-build", "--project", root]}},
+        {"label": "WPILib: Debug Robot Code (roboRIO, experimental LLDB)", "adapter": "CodeLLDB", "request": "launch",
+         "program": f"{root}/build/install/frcUserProgram/linuxathena/debug/lib/frcUserProgram",
+         "targetCreateCommands": [f"target create {root}/build/install/frcUserProgram/linuxathena/debug/lib/frcUserProgram"],
+         "processCreateCommands": [f"gdb-remote {host}:{int(debug_port or 8349)}"],
+         "build": {"command": sys.executable, "args": [*SELF_ARGS, "deploy", "--debug", "--project", root]}},
+    ]
+
+
+def write_json_merged(path: Path, ours, list_key=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        try:
+            cur = load_jsonc(path)
+        except ValueError:
+            backup = path.with_suffix(path.suffix + ".bak")
+            shutil.copy(path, backup)
+            print(yellow(f"{path.name} wasn't valid JSON; saved it as {backup.name}"))
+            cur = None
+        if isinstance(ours, list) and isinstance(cur, list):
+            labels = {o["label"] for o in ours}
+            ours = [c for c in cur if c.get("label") not in labels and not str(c.get("label", "")).startswith("WPILib:")] + ours
+        elif isinstance(ours, dict) and isinstance(cur, dict):
+            ours = deep_merge(cur, ours)
+    header = f"// Written by {MARK} (`wpilib init`). Safe to edit; re-running init updates the WPILib entries.\n"
+    path.write_text(header + json.dumps(ours, indent=2) + "\n")
+
+
+def write_zed_files(p, quiet=False, robot_host=None, debug_port=None):
+    write_json_merged(p.root / ".zed" / "settings.json", zed_settings(p))
+    write_json_merged(p.root / ".zed" / "debug.json", zed_debug(p, robot_host, debug_port))
+    gi = p.root / ".gitignore"
+    have = gi.read_text() if gi.exists() else ""
+    add = []
+    if not re.search(r"^/?\.zed/?$", have, re.M):
+        add.append("# Zed (machine-specific paths; each teammate runs `wpilib init`)\n.zed/\n")
+    if p.language == "cpp" and ".cache/" not in have:
+        add.append("# clangd index\n.cache/\n")
+    if add:
+        with gi.open("a") as f:
+            f.write(("\n" if have and not have.endswith("\n") else "") + "\n" + "\n".join(add))
+    if not quiet:
+        print(green("Zed project files written: ") + ".zed/settings.json, .zed/debug.json")
+
+
+def cmd_init(a):
+    p = Project.find(a.project)
+    write_zed_files(p)
+    if p.language == "cpp" and not a.no_build:
+        refresh_cpp(p, quiet=True, run_gradle=True)
+
+
+# ---------------------------------------------------------------- doctor / updates
+
+
+def cmd_doctor(a):
+    ok = True
+
+    def row(good, label, detail=""):
+        nonlocal ok
+        ok &= bool(good)
+        print(f"  {green('ok ') if good else red('!! ')} {label}  {dim(str(detail))}")
+
+    years = installed_years()
+    row(years, "WPILib installed", ", ".join(years) or f"nothing in {WPILIB_ROOT}")
+    if years:
+        home = wpilib_home()
+        row((home / "jdk" / "bin" / ("java.exe" if IS_WIN else "java")).exists(), "WPILib JDK", home / "jdk")
+        row(list((home / "vsCodeExtensions").glob("vscode-wpilib-*.vsix")), "Project templates (vscode-wpilib vsix)")
+        row((home / "roborio" / "bin").exists(), "roboRIO C++ toolchain", home / "roborio")
+        row(list_tools(home), "WPILib tools", ", ".join(list_tools(home)))
+    row(zed_installed(), "Zed installed")
+    row(shutil.which("wpilib"), "`wpilib` on PATH (needed by Zed tasks)", shutil.which("wpilib") or "run the installer, then restart Zed")
+    tasks = zed_config_dir() / "tasks.json"
+    row(tasks.exists() and "WPILib:" in tasks.read_text(), "Zed WPILib tasks installed", tasks)
+    modern = find_modern_jdk()
+    print(f"  {'ok ' if modern else dim('-- ')} JDK 25+ for Java language server  {dim(modern or 'none; Zed will download one automatically')}")
+    p = Project.find(a.project, required=False)
+    if p:
+        row((p.root / ".zed" / "settings.json").exists(), "Project has .zed settings", p.root)
+        row(int(p.prefs.get("teamNumber", -1)) >= 0, "Team number set", p.prefs.get("teamNumber"))
+    sys.exit(0 if ok else 1)
+
+
+def cmd_update_check(a):
+    years = installed_years()
+    cur = None
+    if years:
+        res = resources(wpilib_home())
+        cur = (res / "gradle" / "version.txt").read_text().strip()
+    try:
+        latest = read_json_url("https://api.github.com/repos/wpilibsuite/allwpilib/releases/latest")["tag_name"].lstrip("v")
+    except Exception as e:
+        die(f"Couldn't check GitHub: {e}")
+    print(f"Installed: {cur}   Latest release: {latest}")
+    if cur and newer(latest, cur):
+        print(yellow("A newer WPILib is out: https://github.com/wpilibsuite/allwpilib/releases/latest"))
+        p = Project.find(None, required=False)
+        if p and p.gradle_version() and newer(latest, p.gradle_version()) and latest.split(".")[0] == p.gradle_version().split(".")[0]:
+            print(f"This project uses GradleRIO {p.gradle_version()}; after installing, update the version in build.gradle.")
+    else:
+        print(green("You're up to date."))
+
+
+def cmd_self_update(a):
+    """Pull the latest zed-wpilib and re-run its installer."""
+    if (REPO_DIR / ".git").exists() and shutil.which("git"):
+        info("Updating zed-wpilib")
+        if subprocess.call(["git", "-C", str(REPO_DIR), "pull", "--ff-only"]) != 0:
+            die("git pull failed; see above.")
+    else:
+        print("This copy wasn't installed with git. Re-run the install command from the README to update.")
+        return
+    sys.exit(subprocess.call([sys.executable, str(REPO_DIR / "install.py")]))
+
+
+# ---------------------------------------------------------------- CLI
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="wpilib", description="WPILib robot-code commands (the VS Code extension's features, for Zed).")
+    ap.add_argument("--project", help="project folder (default: search up from the current directory)")
+    ap.add_argument("--year", help="WPILib year to use (default: newest installed)")
+    sub = ap.add_subparsers(dest="cmd", metavar="COMMAND")
+
+    def add(name, fn, help_, aliases=()):
+        sp = sub.add_parser(name, help=help_, aliases=list(aliases))
+        sp.set_defaults(fn=fn)
+        sp.add_argument("--project", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+        return sp
+
+    sp = add("new", cmd_new, "create a new project from a template or example")
+    sp.add_argument("--type", choices=["templates", "examples"])
+    sp.add_argument("--lang", choices=["java", "cpp"])
+    sp.add_argument("--base", help="template/example name, e.g. 'Command Robot'")
+    sp.add_argument("--dir", help="parent folder")
+    sp.add_argument("--name", help="project (folder) name")
+    sp.add_argument("--team", type=int)
+    sp.add_argument("--desktop", action=argparse.BooleanOptionalAction, default=None)
+    sp.add_argument("--git", action="store_true", help="git init + initial commit")
+    sp.add_argument("--no-open", action="store_true")
+    sp.add_argument("--list", action="store_true", help="list templates and examples")
+
+    for name, fn, h in [("build", cmd_build, "build robot code"), ("test", cmd_test, "run unit tests"),
+                        ("clean", cmd_clean, "gradle clean"), ("gradle", cmd_gradle, "run any gradle command with the WPILib JDK")]:
+        sp = add(name, fn, h)
+        sp.add_argument("extra", nargs=argparse.REMAINDER)
+
+    sp = add("deploy", cmd_deploy, "deploy robot code to the roboRIO")
+    sp.add_argument("--team", type=int)
+    sp.add_argument("--debug", action="store_true", help="deploy in debug mode (for attaching the debugger)")
+    sp.add_argument("extra", nargs=argparse.REMAINDER)
+
+    sp = add("sim", cmd_sim, "simulate robot code on this computer", aliases=["simulate"])
+    sp.add_argument("--hw", action="store_true", help="hardware simulation (-PhwSim)")
+    sp.add_argument("--prepare", action="store_true", help="only build for simulation (used by the Zed debugger)")
+    sp.add_argument("--debug-build", action="store_true", help="C++: use the debug binary")
+    sp.add_argument("extra", nargs=argparse.REMAINDER)
+
+    sp = add("riolog", cmd_riolog, "show the roboRIO console (RioLog)")
+    sp.add_argument("--team", type=int)
+
+    sp = add("team", cmd_team, "set the team number")
+    sp.add_argument("number", nargs="?", type=int)
+
+    sp = add("vendordep", cmd_vendordep, "manage vendor libraries", aliases=["vendor", "vendordeps"])
+    sp.add_argument("action", nargs="?", choices=["list", "add", "update", "remove"])
+    sp.add_argument("target", nargs="?", help="name, URL or file")
+    sp.add_argument("--offline", action="store_true", help="update: only use libraries in the WPILib install")
+    sp.add_argument("--yes", "-y", action="store_true")
+    sp.add_argument("--no-build", action="store_true")
+
+    sp = add("tool", cmd_tool, "start a WPILib tool (Glass, AdvantageScope, Elastic, SysId, ...)", aliases=["tools"])
+    sp.add_argument("name", nargs="?")
+
+    sp = add("new-class", cmd_new_class, "create a new class or command")
+    sp.add_argument("--kind", help="e.g. Command, Subsystem, InstantCommand")
+    sp.add_argument("--name")
+    sp.add_argument("--dir", help="folder to create it in (default: commands/ or subsystems/)")
+    sp.add_argument("--no-open", action="store_true")
+
+    sp = add("import", cmd_import, "import a 2020-2025 project into the current WPILib year")
+    sp.add_argument("source", nargs="?")
+    sp.add_argument("dest", nargs="?")
+    sp.add_argument("--team", type=int)
+    sp.add_argument("--no-open", action="store_true")
+
+    sp = add("docs", cmd_docs, "open WPILib documentation")
+    sp.add_argument("which", nargs="?", choices=["frc-docs", "frc", "guide", "java", "cpp", "c++"])
+    sp.add_argument("--online", action="store_true")
+
+    sp = add("language", cmd_language, "change the project language setting")
+    sp.add_argument("lang", nargs="?", choices=["java", "cpp"])
+
+    sp = add("desktop", cmd_desktop, "turn desktop support on/off (C++ sim and tests)")
+    sp.add_argument("state", nargs="?", choices=["on", "off"])
+
+    sp = add("settings", cmd_settings, "change WPILib settings (offline, skip tests, auto RioLog, ...)")
+    sp.add_argument("key", nargs="?")
+    sp.add_argument("value", nargs="?")
+
+    sp = add("cpp", cmd_cpp, "refresh C++ IntelliSense (clangd) / pick toolchain", aliases=["intellisense"])
+    sp.add_argument("--select", action="store_true", help="pick which toolchain to index")
+    sp.add_argument("--toolchain")
+
+    sp = add("init", cmd_init, "write .zed/settings.json and .zed/debug.json for this project")
+    sp.add_argument("--no-build", action="store_true")
+
+    add("info", cmd_info, "show project information")
+    add("doctor", cmd_doctor, "check that everything is set up")
+    add("update-check", cmd_update_check, "check for a newer WPILib release")
+    add("self-update", cmd_self_update, "update zed-wpilib itself")
+
+    a = ap.parse_args(argv)
+    if not getattr(a, "cmd", None):
+        ap.print_help()
+        return
+    if a.project and "$ZED" in a.project:
+        a.project = None  # Zed variable wasn't substituted; fall back to cwd
+    for k in ("extra",):
+        if hasattr(a, k) and a.extra and a.extra[0] == "--":
+            a.extra = a.extra[1:]
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)

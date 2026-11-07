@@ -1,0 +1,62 @@
+// WPILib tasks for Zed, installed by zed-wpilib's installer.
+// Open the task picker (cmd-shift-r, or "task: spawn") and type "WPILib".
+// @WPILIB@ is replaced with the full path to the `wpilib` command at install time.
+[
+  // ---- the everyday ones
+  { "label": "WPILib: Build Robot Code", "command": "@WPILIB@", "args": ["build"], "save": "all" },
+  { "label": "WPILib: Deploy Robot Code", "command": "@WPILIB@", "args": ["deploy"], "save": "all" },
+  { "label": "WPILib: Simulate Robot Code", "command": "@WPILIB@", "args": ["sim"], "save": "all", "use_new_terminal": true, "allow_concurrent_runs": false },
+  { "label": "WPILib: Simulate Robot Code (Hardware Sim)", "command": "@WPILIB@", "args": ["sim", "--hw"], "save": "all", "use_new_terminal": true },
+  { "label": "WPILib: Test Robot Code", "command": "@WPILIB@", "args": ["test"], "save": "all" },
+  { "label": "WPILib: Start RioLog", "command": "@WPILIB@", "args": ["riolog"], "use_new_terminal": true, "allow_concurrent_runs": false },
+  { "label": "WPILib: Deploy Robot Code in Debug Mode", "command": "@WPILIB@", "args": ["deploy", "--debug"], "save": "all" },
+  { "label": "WPILib: Set Team Number", "command": "@WPILIB@", "args": ["team"] },
+
+  // ---- projects and code
+  { "label": "WPILib: Create a New Project", "command": "@WPILIB@", "args": ["new"], "use_new_terminal": true },
+  { "label": "WPILib: Create a New Project (with git)", "command": "@WPILIB@", "args": ["new", "--git"], "use_new_terminal": true },
+  { "label": "WPILib: Import a 2020-2025 Project", "command": "@WPILIB@", "args": ["import"], "use_new_terminal": true },
+  { "label": "WPILib: Create a New Class/Command", "command": "@WPILIB@", "args": ["new-class", "--dir", "${ZED_DIRNAME:.}"] },
+  { "label": "WPILib: Set Up Zed for This Project", "command": "@WPILIB@", "args": ["init"] },
+
+  // ---- vendor libraries
+  { "label": "WPILib: Manage Vendor Libraries", "command": "@WPILIB@", "args": ["vendordep"] },
+  { "label": "WPILib: Install Vendor Library", "command": "@WPILIB@", "args": ["vendordep", "add"] },
+  { "label": "WPILib: Check for Vendor Library Updates", "command": "@WPILIB@", "args": ["vendordep", "update"] },
+  { "label": "WPILib: Uninstall Vendor Library", "command": "@WPILIB@", "args": ["vendordep", "remove"] },
+  { "label": "WPILib: List Vendor Libraries", "command": "@WPILIB@", "args": ["vendordep", "list"] },
+
+  // ---- tools
+  { "label": "WPILib: Start Tool", "command": "@WPILIB@", "args": ["tool"], "hide": "on_success" },
+  { "label": "WPILib: Start AdvantageScope", "command": "@WPILIB@", "args": ["tool", "AdvantageScope"], "reveal": "never", "hide": "on_success" },
+  { "label": "WPILib: Start Elastic", "command": "@WPILIB@", "args": ["tool", "Elastic"], "reveal": "never", "hide": "on_success" },
+  { "label": "WPILib: Start Glass", "command": "@WPILIB@", "args": ["tool", "Glass"], "reveal": "never", "hide": "on_success" },
+  { "label": "WPILib: Start SysId", "command": "@WPILIB@", "args": ["tool", "SysId"], "reveal": "never", "hide": "on_success" },
+  { "label": "WPILib: Start Shuffleboard", "command": "@WPILIB@", "args": ["tool", "Shuffleboard"], "reveal": "never", "hide": "on_success" },
+  { "label": "WPILib: Start OutlineViewer", "command": "@WPILIB@", "args": ["tool", "OutlineViewer"], "reveal": "never", "hide": "on_success" },
+  { "label": "WPILib: Start PathWeaver", "command": "@WPILIB@", "args": ["tool", "PathWeaver"], "reveal": "never", "hide": "on_success" },
+  { "label": "WPILib: Start Data Log Tool", "command": "@WPILIB@", "args": ["tool", "DataLogTool"], "reveal": "never", "hide": "on_success" },
+  { "label": "WPILib: Start RobotBuilder", "command": "@WPILIB@", "args": ["tool", "RobotBuilder"], "reveal": "never", "hide": "on_success" },
+  { "label": "WPILib: Start roboRIO Team Number Setter", "command": "@WPILIB@", "args": ["tool", "roboRIOTeamNumberSetter"], "reveal": "never", "hide": "on_success" },
+  { "label": "WPILib: Start WPIcal", "command": "@WPILIB@", "args": ["tool", "wpical"], "reveal": "never", "hide": "on_success" },
+
+  // ---- docs and info
+  { "label": "WPILib: Open API Documentation", "command": "@WPILIB@", "args": ["docs"], "reveal": "never", "hide": "on_success" },
+  { "label": "WPILib: Open FRC Docs", "command": "@WPILIB@", "args": ["docs", "frc-docs"], "reveal": "never", "hide": "on_success" },
+  { "label": "WPILib: Open Project Information", "command": "@WPILIB@", "args": ["info"] },
+  { "label": "WPILib: Check for WPILib Updates", "command": "@WPILIB@", "args": ["update-check"] },
+  { "label": "WPILib: Update zed-wpilib", "command": "@WPILIB@", "args": ["self-update"] },
+  { "label": "WPILib: Check Setup (Doctor)", "command": "@WPILIB@", "args": ["doctor"] },
+
+  // ---- settings
+  { "label": "WPILib: Change Settings", "command": "@WPILIB@", "args": ["settings"] },
+  { "label": "WPILib: Toggle Offline Mode", "command": "@WPILIB@", "args": ["settings", "offline"] },
+  { "label": "WPILib: Change Language Setting", "command": "@WPILIB@", "args": ["language"] },
+  { "label": "WPILib: Change Desktop Support Setting", "command": "@WPILIB@", "args": ["desktop"] },
+
+  // ---- C++ and gradle
+  { "label": "WPILib: Refresh C++ IntelliSense", "command": "@WPILIB@", "args": ["cpp"] },
+  { "label": "WPILib: Select C++ IntelliSense Toolchain", "command": "@WPILIB@", "args": ["cpp", "--select"] },
+  { "label": "WPILib: Run a Gradle Command", "command": "@WPILIB@", "args": ["gradle"] },
+  { "label": "WPILib: Clean", "command": "@WPILIB@", "args": ["clean"] }
+]
