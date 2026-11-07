@@ -1,9 +1,9 @@
 # zed-wpilib installer for Windows. Teammates run this in PowerShell:
-#   irm https://raw.githubusercontent.com/OWNER/zed-wpilib/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/radiobone/zed-wpilib/main/install.ps1 | iex
 # Running it again updates. From a clone you can also run:  powershell -ExecutionPolicy Bypass -File install.ps1
 $ErrorActionPreference = 'Stop'
 
-$Repo   = if ($env:ZED_WPILIB_REPO)   { $env:ZED_WPILIB_REPO }   else { 'https://github.com/OWNER/zed-wpilib' }
+$Repo   = if ($env:ZED_WPILIB_REPO)   { $env:ZED_WPILIB_REPO }   else { 'https://github.com/radiobone/zed-wpilib' }
 $Branch = if ($env:ZED_WPILIB_BRANCH) { $env:ZED_WPILIB_BRANCH } else { 'main' }
 $Dest   = if ($env:ZED_WPILIB_DIR)    { $env:ZED_WPILIB_DIR }    else { Join-Path $env:LOCALAPPDATA 'zed-wpilib\app' }
 

@@ -1,10 +1,10 @@
 #!/bin/sh
 # zed-wpilib installer for macOS and Linux. Teammates run:
-#   curl -fsSL https://raw.githubusercontent.com/OWNER/zed-wpilib/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/radiobone/zed-wpilib/main/install.sh | sh
 # Running it again updates. From a clone you can also just run ./install.sh
 set -eu
 
-REPO="${ZED_WPILIB_REPO:-https://github.com/OWNER/zed-wpilib}"
+REPO="${ZED_WPILIB_REPO:-https://github.com/radiobone/zed-wpilib}"
 BRANCH="${ZED_WPILIB_BRANCH:-main}"
 DEST="${ZED_WPILIB_DIR:-$HOME/.local/share/zed-wpilib}"
 

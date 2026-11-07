@@ -15,12 +15,12 @@ Then run one command.
 
 **Windows** (in PowerShell):
 ```powershell
-irm https://raw.githubusercontent.com/OWNER/zed-wpilib/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/radiobone/zed-wpilib/main/install.ps1 | iex
 ```
 
 **macOS / Linux** (in Terminal):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/zed-wpilib/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/radiobone/zed-wpilib/main/install.sh | sh
 ```
 
 **Restart Zed** afterwards; it installs its Java extension on startup.
